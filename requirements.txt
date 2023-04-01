@@ -1,0 +1,13 @@
+transformers
+numpy
+scikit-learn
+tqdm
+pandas
+torch
+pyhocon
+
+tqdm
+torchtext
+spacy
+matplotlib
+google-api-python-client
