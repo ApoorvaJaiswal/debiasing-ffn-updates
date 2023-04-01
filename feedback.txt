@@ -1,0 +1,8 @@
+
+This is a very technical project, and the proposal is well structured. You seem to have a pretty good idea on how to proceed with this project. Please see feedback below:
+
+You'll need to pick your baselines carefully based on how you plan to evaluate bias. If you want to run them yourselves, make sure that they are either open-sourced or hosted on huggingface so that you can easily access them. Alternatively, you can compare your method to others that have been evaluated on the same metrics as the ones you plan to use, so that you can directly take values from tables in those papers.
+
+Overall, I'm very impressed by your proposal. Looking forward to your final report!
+
+- Yapei

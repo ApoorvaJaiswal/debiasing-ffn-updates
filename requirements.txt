@@ -11,3 +11,5 @@ torchtext
 spacy
 matplotlib
 google-api-python-client
+
+bigbench
