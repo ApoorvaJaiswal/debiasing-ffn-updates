@@ -23,6 +23,8 @@ class GPT2Wrapper():
         self._tokenizer.pad_token = self._tokenizer.eos_token
         self._model.config.pad_token_id = self._tokenizer.eos_token_id
         
+        self._max_input_length = 1024
+
         self.hooks = None
 
     def query_model_tok_dist(self, prompt):
@@ -181,6 +183,152 @@ class GPT2Wrapper():
 
 
     ## From Big Bench ##
+
+    ## Alex confirmed this works
+    def _left_pad_ragged_lists(
+        self,
+        ragged_lists: List[List[int]],
+        pad_value: int,
+        shape: Optional[Tuple[int, int]] = None,
+    ) -> np.array:
+        """Pad ragged lists from the left.
+
+        Example: [[1,2,3], [4]] -> [[1,2,3], [pad_value, pad_value, 4]]
+
+        Args:
+        ragged_lists: List of lists with unequal lengths.
+        pad_value: padding token
+        shape: If None (default) it will padd to the longest element in the
+            ragged_lists. If not None, it will return a tensor of this shape either
+            padded or truncated
+
+        Returns:
+        Left padded regular 2D list.
+        """
+
+        max_len = max([len(lst) for lst in ragged_lists])
+        reversed_tensor = torch.tensor([lst[::-1] + [pad_value] * (max_len - len(lst)) for lst in ragged_lists])
+        padded_tensor = reversed_tensor.flip(dims=(1,))
+        if shape is not None:
+            padded_tensor = F.pad(torch.tensor(target_ids), (10,0), 'constant', pad_value)
+            for d in range(len(shape)):
+                if padded_tensor.size()[d] > shape[d]:
+                    padded_tensor = torch.narrow(padded_tensor, d, 0, shape[d])
+        return padded_tensor.numpy()
+    
+    def _left_pad_constant_length(self, input_tensor, pad_value, length):
+        """
+        Adds padding to the left of each list.
+
+        Originally _left_pad_ragged_lists took care of this use case too but torch does
+        not have an analogous implementation of tf.RaggedTensor
+        """
+        return F.pad(torch.tensor(input_tensor), (length,0), 'constant', pad_value)
+
+    def _gpt_batch_tokenize(
+        self,
+        batch_inputs: List[str],
+        batch_targets: Optional[List[str]] = None,
+        mask_token_id: int = -100,
+    ) -> Dict[str, np.array]:
+        """Tokenize and prepare batches of input and target string pairs for GPT
+        (gpt2 or openai-gpt) scoring or generation.
+
+        The tokenization requires a pad_token to be defined, and the padding is
+        done on the left side.
+
+        Args:
+            tokenizer: GPT compatible tokenizer. Assumes it has a defined
+            pad_token defined.
+            batch_inputs: List of string inputs
+            batch_targets: Optional list of string targets. If None (default), the
+            returned tokenization is equivalent to the targets being empty strings.
+            mask_token_id: Token id that is used in the returned target_ids to mark
+            tokens corresponing to the input.
+
+        Returns:
+            Dictionary with entries:
+            inputs_and_targets_ids: token_ids for inputs and targets (concatenated)
+            targets_ids: Copy of the token_ids for inputs and targets where the
+                input tokens is masked with mask_token_id.
+            attention_mask: 0 where input_ids is masked, 1 otherwise.
+            position_ids: Position ids to account for padding according to the
+                attention_mask.
+        """
+
+        assert self._tokenizer.pad_token_id is not None, "Tokenizer must set pad_token_id."
+
+        ragged_inputs_ids = self._tokenizer(batch_inputs)["input_ids"]
+        
+        if batch_targets:
+            assert len(batch_inputs) == len(batch_targets), "Inputs and targets must have the same length."
+            ragged_targets_ids = self._tokenizer(batch_targets)["input_ids"]
+        else:
+            ragged_targets_ids = [[] for _ in batch_inputs]
+
+        ragged_inputs_and_targets_ids = [
+            inp + tar for inp, tar in zip(ragged_inputs_ids, ragged_targets_ids)
+        ]
+
+        inputs_and_targets_ids = self._left_pad_ragged_lists(
+            ragged_lists=ragged_inputs_and_targets_ids, pad_value=self._tokenizer.pad_token_id
+        )
+        
+        targets_ids = self._left_pad_constant_length(
+            input_tensor=ragged_targets_ids,
+            pad_value=mask_token_id,
+            length=inputs_and_targets_ids.shape[1]-1,
+        )
+
+        # Infer the values of the attention_mask and position_ids:
+        attention_mask = inputs_and_targets_ids != self._tokenizer.pad_token_id
+        attention_mask = attention_mask.astype(inputs_and_targets_ids.dtype)
+
+        position_ids = np.maximum(np.cumsum(attention_mask, axis=-1) - 1, 0)
+
+        return {
+            "inputs_and_targets_ids": inputs_and_targets_ids,
+            "targets_ids": targets_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
+
+    # def compute_loss(self, labels: np.array, logits: np.array):
+    #     loss_fn = CrossEntropyLoss(
+    #         from_logits=True, reduction=tf.keras.losses.Reduction.NONE
+    #     )
+    #     # When scoring step N, the target token is the next input token at step N+1, so we 
+    #     # shift all labels one step to the left before giving the labels to the loss funciton.
+    #     shifted_labels = np.roll(labels, -1)
+    #     # always mask the last shifted token (== first token before the shift)
+    #     shifted_labels[:,-1]=-100
+    #     # Clip negative/masked labels to zero - those will get masked later anyway
+    #     unmasked_loss = loss_fn(tf.nn.relu(shifted_labels), logits)
+    #     # make sure only labels that are not equal to -100 affect the loss
+    #     loss_mask = tf.cast(shifted_labels != -100, dtype=unmasked_loss.dtype)
+    #     masked_loss = unmasked_loss * loss_mask
+    #     reduced_masked_loss = tf.reduce_sum(masked_loss, axis=1)
+    #     return (-reduced_masked_loss).numpy().tolist()
+    
+    def compute_loss(self, labels: np.array, logits: np.array):
+        loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
+        # When scoring step N, the target token is the next input token at step N+1, so we 
+        # shift all labels one step to the left before giving the labels to the loss function.
+        shifted_labels = np.roll(labels, -1, axis=1)
+        # always mask the last shifted token (== first token before the shift)
+        shifted_labels[:, -1] = -100
+        # Convert arrays to tensors
+        shifted_labels = torch.tensor(shifted_labels, dtype=torch.long)
+        logits = torch.tensor(logits, dtype=torch.float32)
+        # Clip negative/masked labels to zero - those will get masked later anyway
+        # Compute loss
+        unmasked_loss = loss_fn(logits.transpose(1,2), torch.clamp_min(shifted_labels, 0))
+        # make sure only labels that are not equal to -100 affect the loss
+        loss_mask = (shifted_labels != -100).type_as(unmasked_loss)
+        masked_loss = unmasked_loss * loss_mask
+        reduced_masked_loss = masked_loss.sum(dim=1)
+        return (-reduced_masked_loss).cpu().numpy().tolist()
+
     def score(
         self,
         inputs: Union[List[str], str],
@@ -202,23 +350,18 @@ class GPT2Wrapper():
             input_list = inputs
             target_list = targets
 
-        tokenized_ids = _gpt_batch_tokenize(
-            tokenizer=self._tokenizer,
+        tokenized_ids = self._gpt_batch_tokenize(
             batch_inputs=input_list,
             batch_targets=target_list,
         )
 
-        inputs_and_targets_ids = tf.constant(tokenized_ids["inputs_and_targets_ids"])
-        targets_ids = tf.constant(tokenized_ids["targets_ids"])
-        attention_mask = tf.constant(tokenized_ids["attention_mask"])
+        #TODO Handle Truncation ... GPT2 max input is 1024
 
-        inputs_and_targets_ids = self._maybe_truncate_input(
-            inputs_and_targets_ids, verbose=True
-        )
-        targets_ids = self._maybe_truncate_input(targets_ids, verbose=False)
-        attention_mask = self._maybe_truncate_input(attention_mask, verbose=False)
-        # Calculating position ids, since they might be changed by truncation
-        position_ids = tf.maximum(tf.cumsum(attention_mask, axis=-1) - 1, 0)
+        inputs_and_targets_ids = torch.tensor(tokenized_ids["inputs_and_targets_ids"])
+        targets_ids = torch.tensor(tokenized_ids["targets_ids"])
+        attention_mask = torch.tensor(tokenized_ids["attention_mask"])
+
+        position_ids = torch.maximum(torch.cumsum(torch.tensor(attention_mask), axis=-1) - 1, torch.tensor(0))
 
         logits = self._model(
             inputs_and_targets_ids,
@@ -226,6 +369,9 @@ class GPT2Wrapper():
             attention_mask=attention_mask,
             position_ids=position_ids,
         ).logits
+
+        # print(logits)
+        # print(targets_ids)
 
         return self.compute_loss(targets_ids, logits)
 
@@ -281,8 +427,6 @@ class GPT2Wrapper():
                 flat_choices.append(choice)
 
         flat_idx, flat_inputs, flat_choices
-        print(flat_inputs[0])
-        print(flat_choices[0])
     
         num_examples = len(flat_idx)
         flat_scores = []
@@ -291,34 +435,29 @@ class GPT2Wrapper():
             batch_inputs = flat_inputs[idx : min(idx + batch_size, num_examples)]
             batch_choices = flat_choices[idx : min(idx + batch_size, num_examples)]
 
-            print("BATCH INPUTS")
-            print(batch_inputs)
+            batch_scores = self.score(batch_inputs, batch_choices)
+            flat_scores += batch_scores
 
-            print("BATCH CHOICES")
-            print(batch_choices)
-        #     batch_scores = self._model.score(batch_inputs, batch_choices)
-        #     flat_scores += batch_scores
+        scores = [[] for _ in range(len(input_list))]
 
-        # scores = [[] for _ in range(len(input_list))]
+        for idx, score in zip(flat_idx, flat_scores):
+            if score == 0:
+              # all tokens were masked. Setting score to -inf.
+              logging.warning('Found score identical to zero. Probably from empty target. '
+                             'Setting score to -inf.'
+                            )
+              scores[idx[0]].append(-np.inf)
+            else:
+              scores[idx[0]].append(score)
 
-        # for idx, score in zip(flat_idx, flat_scores):
-        #     if score == 0:
-        #       # all tokens were masked. Setting score to -inf.
-        #       logging.warning('Found score identical to zero. Probably from empty target. '
-        #                      'Setting score to -inf.'
-        #                     )
-        #       scores[idx[0]].append(-np.inf)
-        #     else:
-        #       scores[idx[0]].append(score)
+        if not absolute_normalization:
+            scores = [
+                list(score_row - scipy.special.logsumexp(score_row))
+                for score_row in scores
+            ]
 
-        # if not absolute_normalization:
-        #     scores = [
-        #         list(score_row - scipy.special.logsumexp(score_row))
-        #         for score_row in scores
-        #     ]
+        if isinstance(inputs, str):
+            scores = scores[0]
 
-        # if isinstance(inputs, str):
-        #     scores = scores[0]
-
-        # return scores
+        return scores
     
