@@ -4,6 +4,7 @@ import torch
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
 import scipy
 import logging
+import tensorflow as tf
 
 import numpy as np
 import torch.nn.functional as F
@@ -205,26 +206,15 @@ class GPT2Wrapper():
         Returns:
         Left padded regular 2D list.
         """
-
-        max_len = max([len(lst) for lst in ragged_lists])
-        reversed_tensor = torch.tensor([lst[::-1] + [pad_value] * (max_len - len(lst)) for lst in ragged_lists])
-        padded_tensor = reversed_tensor.flip(dims=(1,))
-        if shape is not None:
-            padded_tensor = F.pad(torch.tensor(target_ids), (10,0), 'constant', pad_value)
-            for d in range(len(shape)):
-                if padded_tensor.size()[d] > shape[d]:
-                    padded_tensor = torch.narrow(padded_tensor, d, 0, shape[d])
+        # TF padding is be done from the right.
+        # To pad from left we reverse tensor first, then pad, and reverse again:
+        ragged_lists = tf.ragged.constant(ragged_lists)
+        reversed_tensor = tf.reverse(ragged_lists, [-1])
+        padded = reversed_tensor.to_tensor(pad_value, shape=shape)  # padding
+        padded_tensor = tf.reverse(padded, [-1])
+        padded_tensor = tf.cast(padded_tensor, dtype=tf.int64)
         return padded_tensor.numpy()
     
-    def _left_pad_constant_length(self, input_tensor, pad_value, length):
-        """
-        Adds padding to the left of each list.
-
-        Originally _left_pad_ragged_lists took care of this use case too but torch does
-        not have an analogous implementation of tf.RaggedTensor
-        """
-        return F.pad(torch.tensor(input_tensor), (length,0), 'constant', pad_value)
-
     def _gpt_batch_tokenize(
         self,
         batch_inputs: List[str],
@@ -274,10 +264,10 @@ class GPT2Wrapper():
             ragged_lists=ragged_inputs_and_targets_ids, pad_value=self._tokenizer.pad_token_id
         )
         
-        targets_ids = self._left_pad_constant_length(
-            input_tensor=ragged_targets_ids,
+        targets_ids = self._left_pad_ragged_lists(
+            ragged_lists=ragged_targets_ids,
             pad_value=mask_token_id,
-            length=inputs_and_targets_ids.shape[1]-1,
+            shape=inputs_and_targets_ids.shape,
         )
 
         # Infer the values of the attention_mask and position_ids:
@@ -357,11 +347,11 @@ class GPT2Wrapper():
 
         #TODO Handle Truncation ... GPT2 max input is 1024
 
-        inputs_and_targets_ids = torch.tensor(tokenized_ids["inputs_and_targets_ids"])
-        targets_ids = torch.tensor(tokenized_ids["targets_ids"])
-        attention_mask = torch.tensor(tokenized_ids["attention_mask"])
+        inputs_and_targets_ids = torch.tensor(tokenized_ids["inputs_and_targets_ids"], dtype=torch.long)
+        targets_ids = torch.tensor(tokenized_ids["targets_ids"], dtype=torch.long)
+        attention_mask = torch.tensor(tokenized_ids["attention_mask"], dtype=torch.long)
 
-        position_ids = torch.maximum(torch.cumsum(torch.tensor(attention_mask), axis=-1) - 1, torch.tensor(0))
+        position_ids = torch.maximum(torch.cumsum(attention_mask, axis=-1) - 1, torch.tensor(0))
 
         logits = self._model(
             inputs_and_targets_ids,
@@ -374,6 +364,18 @@ class GPT2Wrapper():
         # print(targets_ids)
 
         return self.compute_loss(targets_ids, logits)
+    
+    def flatten_multiple_choice_examples(self, inputs, targets):
+        flat_idx = []
+        flat_inputs = []
+        flat_choices = []
+        for example_id, (example_input, choices) in enumerate(zip(inputs, targets)):
+            for choice_id, choice in enumerate(choices):
+                flat_idx.append((example_id, choice_id))
+                flat_inputs.append(example_input)
+                flat_choices.append(choice)
+
+        return flat_idx, flat_inputs, flat_choices
 
     def cond_log_prob(
         self,
@@ -417,17 +419,9 @@ class GPT2Wrapper():
             input_list = inputs
             target_list = targets
 
-        flat_idx = []
-        flat_inputs = []
-        flat_choices = []
-        for example_id, (example_input, choices) in enumerate(zip(input_list, target_list)):
-            for choice_id, choice in enumerate(choices):
-                flat_idx.append((example_id, choice_id))
-                flat_inputs.append(example_input)
-                flat_choices.append(choice)
-
-        flat_idx, flat_inputs, flat_choices
-    
+        flat_idx, flat_inputs, flat_choices = self.flatten_multiple_choice_examples(
+            inputs=input_list, targets=target_list
+        )
         num_examples = len(flat_idx)
         flat_scores = []
         for idx in range(0, num_examples, batch_size):
