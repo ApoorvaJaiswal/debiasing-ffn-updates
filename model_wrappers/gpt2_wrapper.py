@@ -345,11 +345,11 @@ class GPT2Wrapper():
             batch_targets=target_list,
         )
 
-        #TODO Handle Truncation ... GPT2 max input is 1024
+        # #TODO Handle Truncation ... GPT2 max input is 1024
 
-        inputs_and_targets_ids = torch.tensor(tokenized_ids["inputs_and_targets_ids"], dtype=torch.long)
-        targets_ids = torch.tensor(tokenized_ids["targets_ids"], dtype=torch.long)
-        attention_mask = torch.tensor(tokenized_ids["attention_mask"], dtype=torch.long)
+        inputs_and_targets_ids = torch.tensor(tokenized_ids["inputs_and_targets_ids"], dtype=torch.long).to(self._device)
+        targets_ids = torch.tensor(tokenized_ids["targets_ids"], dtype=torch.long).to(self._device)
+        attention_mask = torch.tensor(tokenized_ids["attention_mask"], dtype=torch.long).to(self._device)
 
         position_ids = torch.maximum(torch.cumsum(attention_mask, axis=-1) - 1, torch.tensor(0))
 
@@ -363,7 +363,7 @@ class GPT2Wrapper():
         # print(logits)
         # print(targets_ids)
 
-        return self.compute_loss(targets_ids, logits)
+        return self.compute_loss(targets_ids.cpu(), logits.cpu())
     
     def flatten_multiple_choice_examples(self, inputs, targets):
         flat_idx = []
