@@ -10,7 +10,7 @@ import numpy as np
 import torch.nn.functional as F
 
 class GPT2Wrapper():
-    def __init__(self, model_name: str = "gpt2-medium", use_cuda: bool = False):
+    def __init__(self, model_name: str = "gpt2-medium", local_model_path = None, use_cuda: bool = False):
         """
         :param model_name: the name of the pretrained GPT2 model (default: "gpt2-medium")
         :param use_cuda: whether to use CUDA
@@ -18,7 +18,10 @@ class GPT2Wrapper():
         self._device = "cuda:0" if torch.cuda.is_available() and use_cuda else "cpu"
 
         self._tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-        self._model = GPT2LMHeadModel.from_pretrained(model_name)  
+        if local_model_path:
+            GPT2LMHeadModel.from_pretrained(local_model_path)
+        else:
+            self._model = GPT2LMHeadModel.from_pretrained(model_name)  
         if use_cuda:
             self._model.parallelize()
         self._tokenizer.pad_token = self._tokenizer.eos_token
