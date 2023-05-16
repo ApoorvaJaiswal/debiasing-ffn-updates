@@ -88,58 +88,12 @@ class GPT2Wrapper():
         value_preds = [(self._tokenizer.decode(t[0]), t[1]) for t in top_k]
         
         return value_preds
-    
-    def generate_word_filter(self,
-                 prompt: Union[str, List[str]],
-                 min_length: int = 20, 
-                 max_length: int = 20, 
-                 **model_kwargs) -> List[str]:
-        
-        bad_words = open("word_filter_words.txt").read().split("\n")
-        bad_words_ids = [
-            self._tokenizer.encode(bad_word, add_prefix_space=True) 
-            for bad_word in bad_words
-        ]
-        
-        if isinstance(prompt, str):
-            prompt = [prompt]
-        
-        inputs = self._tokenizer.batch_encode_plus(prompt, padding=True, return_tensors='pt')
-        inputs['attention_mask'] = torch.flip(inputs['attention_mask'], dims=[1])
-        shifts = inputs['attention_mask'].shape[-1] - inputs['attention_mask'].sum(dim=-1)
-        for batch_idx in range(inputs['input_ids'].shape[0]):
-            inputs['input_ids'][batch_idx] = inputs['input_ids'][batch_idx].roll(shifts[batch_idx].item())
-
-        inputs = {k: v.to(self._device) for k, v in inputs.items()}
-        input_length = inputs['input_ids'].shape[1]
-        if min_length is not None:
-            min_length = min_length + input_length
-        if max_length is not None:
-            max_length = max_length + input_length
-        
-        output_ids = self._model.generate(**inputs, 
-                                          min_length=min_length, max_length=max_length, 
-                                          bad_words_ids=bad_words_ids,
-                                          **model_kwargs)
 
         # only return the continuation text
         batch_size = output_ids.shape[0]
         output_ids = output_ids[:batch_size, inputs['input_ids'].shape[1]:]
 
         return self._tokenizer.batch_decode(output_ids)
-
-    def compute_loss(self, input_ids: torch.LongTensor, labels: torch.LongTensor) -> torch.Tensor:
-        outputs = self._model(input_ids, labels=labels)
-        lm_logits = outputs[1]
-
-        # Shift so that tokens < n predict n
-        shift_logits = lm_logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        # Flatten the tokens
-        loss_fct = CrossEntropyLoss()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        
-        return loss
 
     def set_value_activations(self, 
                               values_per_layer: Dict[int, List[int]], 
@@ -186,9 +140,6 @@ class GPT2Wrapper():
             print("No hooks to remove")
 
 
-    ## From Big Bench ##
-
-    ## Alex confirmed this works
     def _left_pad_ragged_lists(
         self,
         ragged_lists: List[List[int]],
@@ -286,23 +237,6 @@ class GPT2Wrapper():
             "position_ids": position_ids,
         }
 
-    # def compute_loss(self, labels: np.array, logits: np.array):
-    #     loss_fn = CrossEntropyLoss(
-    #         from_logits=True, reduction=tf.keras.losses.Reduction.NONE
-    #     )
-    #     # When scoring step N, the target token is the next input token at step N+1, so we 
-    #     # shift all labels one step to the left before giving the labels to the loss funciton.
-    #     shifted_labels = np.roll(labels, -1)
-    #     # always mask the last shifted token (== first token before the shift)
-    #     shifted_labels[:,-1]=-100
-    #     # Clip negative/masked labels to zero - those will get masked later anyway
-    #     unmasked_loss = loss_fn(tf.nn.relu(shifted_labels), logits)
-    #     # make sure only labels that are not equal to -100 affect the loss
-    #     loss_mask = tf.cast(shifted_labels != -100, dtype=unmasked_loss.dtype)
-    #     masked_loss = unmasked_loss * loss_mask
-    #     reduced_masked_loss = tf.reduce_sum(masked_loss, axis=1)
-    #     return (-reduced_masked_loss).numpy().tolist()
-    
     def compute_loss(self, labels: np.array, logits: np.array):
         loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
         # When scoring step N, the target token is the next input token at step N+1, so we 
